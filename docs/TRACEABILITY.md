@@ -2,8 +2,8 @@
 
 Este documento liga cada arquivo do projeto original `Monitora_Reserv` (ESP8266) ao destino no `MoniRes_ESP32` (ESP32) e registra o estagio em que ele sera portado.
 
-- Original: `d:\Joao\OneDrive\Documentos\Arduino\Monitora_Reserv`
-- Novo: `d:\Joao\OneDrive\Documentos\Arduino\MoniRes_ESP32`
+- Original: `d:\João\OneDrive\Documentos\Arduino\Monitora_Reserv`
+- Novo: `d:\João\OneDrive\Documentos\Arduino\MoniRes_ESP32`
 - Ultima atualizacao: 2026-11-23 (Etapa 1)
 
 ## Copiados sem nenhuma alteracao

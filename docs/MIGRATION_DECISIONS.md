@@ -2,8 +2,8 @@
 
 - **Data:** 2026-11-23
 - **Base:** relatorio de auditoria do projeto `Monitora_Reserv` (ESP8266 / NodeMCU ESP-12E) apresentado e aprovado.
-- **Projeto original:** `d:\Joao\OneDrive\Documentos\Arduino\Monitora_Reserv` (ESP8266). Permanece **absolutamente intocado**.
-- **Novo projeto:** `d:\Joao\OneDrive\Documentos\Arduino\MoniRes_ESP32` (ESP32 DevKit V1 30 pinos, ESP32-WROOM-32, CH340), com repositorio Git independente.
+- **Projeto original:** `d:\João\OneDrive\Documentos\Arduino\Monitora_Reserv` (ESP8266). Permanece **absolutamente intocado**.
+- **Novo projeto:** `d:\João\OneDrive\Documentos\Arduino\MoniRes_ESP32` (ESP32 DevKit V1 30 pinos, ESP32-WROOM-32, CH340), com repositorio Git independente.
 - **Placa e pinagem aprovadas:** QDY30A em **GPIO34**; TM1637 **CLK=GPIO22**, **DIO=GPIO23**; botao **GPIO16** (ativo em nivel ALTO).
 
 ## Regras inviolaveis

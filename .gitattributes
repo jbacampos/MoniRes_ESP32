@@ -1,0 +1,3 @@
+# Preservar os bytes exatos dos arquivos copiados do projeto original (LF).
+# Sem conversao automatica de fim de linha pelo Git no Windows.
+* -text
