@@ -1,5 +1,5 @@
 // ============================================================================
-//  MoniRes_ESP32 - Etapa 3: camada de hardware (ADC, display, botao)
+//  MoniRes_ESP32 - Etapa 7: integração Wi-Fi / NTP
 //
 //  Este arquivo substitui o esqueleto da Etapa 1. Nesta etapa, so sao
 //  orquestrados:
@@ -7,30 +7,39 @@
 //   - filtro de media movel (50 amostras);
 //   - display TM1637 (CLK=GPIO22, DIO=GPIO23);
 //   - botao de religamento do display (GPIO16, ativo em HIGH);
-//   - temporizacoes preservadas (250 ms, 15 s, 28 s, 30 ms).
+//   - temporizacoes preservadas (250 ms, 15 s, 28 s, 30 ms);
+//   - Wi-Fi e sincronizacao NTP.
 //
 //  Nao ha Wi-Fi, MQTT, Telegram, LittleFS nem historico: esses modulos
 //  entram nas etapas seguintes.
 // ============================================================================
 
 #include <Arduino.h>
+#include <WiFiClientSecure.h>
 
 #include "config.h"
+#include "credentials.h"
 #include "display.h"
 #include "moving_average.h"
 #include "sensor.h"
 #include "simulator.h"
+#include "tb_ca_cert.h"
 #include "uptime.h"
 #include "volume.h"
+#include "wifi_manager.h"
+#include "clock.h"
+#include "thingsboard_manager.h"
 
 namespace {
 
 constexpr char kProjectName[] = "MoniRes_ESP32";
-constexpr char kStageName[] = "Etapa 3 - hardware";
+constexpr char kStageName[] = "Etapa 7 - Wi-Fi / NTP";
 
 MovingAverage g_volumeFilter(MOVING_AVERAGE_WINDOW);
 DisplayManager g_display;
 UptimeCounter g_uptime;
+WiFiManager g_wifi;
+ThingsBoardManager g_thingsBoard;
 
 volume::Measurement g_lastMeasurement;
 float g_filteredLiters = 0.0f;
@@ -68,6 +77,23 @@ void printDiagnostics(uint32_t nowMs) {
                   Simulator::scenarioName(SIM_SCENARIO),
                   static_cast<unsigned>(g_volumeFilter.sampleCount()),
                   static_cast<unsigned>(MOVING_AVERAGE_WINDOW));
+  }
+
+  // Informacoes de Wi-Fi e hora
+  if (g_wifi.connected()) {
+    Serial.print(" | wifi=ok");
+    // No STA do ESP32 o campo 'canal' e' omitido para evitar dependencia.
+    Serial.printf(" rssi=%d", static_cast<int>(g_wifi.rssi()));
+  } else {
+    Serial.print(" | wifi=off");
+  }
+
+  if (device_clock::synced()) {
+    uint64_t ms = device_clock::nowMs();
+    Serial.printf(" | hora=%lu.%03lu", static_cast<unsigned long>(ms / 1000),
+      static_cast<unsigned long>(ms % 1000));
+  } else {
+    Serial.print(" | hora=off");
   }
 
   Serial.println();
@@ -126,6 +152,11 @@ void setup() {
   sensor::begin(now);
   g_display.begin(now);
 
+  // Wi-Fi e NTP
+  g_wifi.begin(now);
+  device_clock::begin(now);  // Use device_clock:: prefix
+  g_thingsBoard.begin(now);
+
   g_lastSampleMs = now;
 
   // Primeira amostra e primeiro diagnostico imediatos.
@@ -140,6 +171,9 @@ void loop() {
   // Acumula o uptime em toda iteracao (wrap-safe por millis()).
   g_uptime.update(now);
 
+  g_wifi.update(now);
+  device_clock::update(now, g_wifi.connected());
+
   // Aquisicao do sensor a cada SAMPLE_INTERVAL_MS.
   if ((now - g_lastSampleMs) >= SAMPLE_INTERVAL_MS) {
     sampleAndProcess(now);
@@ -147,6 +181,14 @@ void loop() {
 
   // Refresh, desligamento e botao do display (temporizacao interna propria).
   g_display.update(now);
+
+  TelemetrySample sample;
+  sample.volumeL = g_filteredLiters;
+  sample.timestampMs = device_clock::synced() ? device_clock::nowMs() : 0;
+  sample.uptimeS = g_uptime.seconds();
+  sample.valid = g_hasSample;
+
+  g_thingsBoard.update(now, sample, g_wifi.connected());
 
   // Diagnostico em frequencia propria.
   if ((now - g_lastDiagnosticMs) >= DIAGNOSTIC_INTERVAL_MS) {
