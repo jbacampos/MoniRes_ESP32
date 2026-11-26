@@ -41,7 +41,10 @@ constexpr bool TEST_MODE = true;  // true = test, false = production
 //  Nao existe outra copia da versao no projeto.
 // ---------------------------------------------------------------------------
 // constexpr char FIRMWARE_VERSION[] = "1.0.0"; // Migração de ESP8266 para ESP32
-constexpr char FIRMWARE_VERSION[] = "2.0.0"; // Publicação no ThingsBoard e comandos e alertas do Telegram
+// O valor TEM de ser igual ao tag da release publicada: o /ota compara o tag com
+// esta string, e um binario cuja versao interna fica atras do proprio tag faz o
+// dispositivo reinstalar a mesma imagem em todo /ota.
+constexpr char FIRMWARE_VERSION[] = "2.1.1"; // Publicação no ThingsBoard e comandos e alertas do Telegram
 
 // ---------------------------------------------------------------------------
 //  Hardware (ESP32 DevKit V1 30 pinos / WROOM-32)
@@ -387,12 +390,81 @@ constexpr size_t TELEGRAM_TEXT_MAX = 64;
 // proximo boot. Nada e persistido em flash.
 constexpr uint8_t TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS = 3;
 
+// ---------------------------------------------------------------------------
+//  /reboot - offset persistido
+//
+//  Um /reboot confirmado precisa deixar o PROXIMO offset em flash antes de
+//  reiniciar; sem isso o Telegram reenviaria o mesmo update depois do boot e o
+//  comando entraria em ciclo. Dois slots A/B de 24 B, com CRC32 e geracao -
+//  mesmo padrao de ALERT_FILE_A/B; o formato do registro fica em
+//  src/telegram.cpp. A gravacao acontece SOMENTE no /reboot: durante o polling
+//  normal nada e escrito em flash.
+// ---------------------------------------------------------------------------
+constexpr char TELEGRAM_OFFSET_FILE_A[] = "/t-offset-a.dat";
+constexpr char TELEGRAM_OFFSET_FILE_B[] = "/t-offset-b.dat";
+
+// Espera curta entre a confirmacao enviada e o ESP.restart(): tempo para o
+// socket TLS fechar e o UART terminar de transmitir o log. NAO e espera do
+// envio - sendMessage() so retorna depois de ler a resposta do Telegram.
+constexpr uint32_t TELEGRAM_REBOOT_SETTLE_MS = 100UL;
+
+static_assert(TELEGRAM_REBOOT_SETTLE_MS < TELEGRAM_RESPONSE_TIMEOUT_MS,
+              "a espera antes do reboot deve ser curta");
+
 static_assert(TELEGRAM_PORT == 443, "TELEGRAM_PORT deve ser 443 (HTTPS)");
 static_assert(TELEGRAM_RESPONSE_TIMEOUT_MS < TELEGRAM_POLL_INTERVAL_MS,
               "o timeout da resposta deve caber no intervalo de polling");
 static_assert(TELEGRAM_BODY_MAX <= 4096, "corpo HTTP maximo acima do razoavel");
 static_assert(TELEGRAM_GATE_RECOVERY_PERIOD_MS >= TELEGRAM_POLL_INTERVAL_MS,
               "a recuperacao nao pode ser mais frequente que o polling");
+
+// ---------------------------------------------------------------------------
+//  Atualizacao remota (OTA) pelo GitHub - B5.2
+//
+//  Fluxo: /ota -> marcador em NVS -> reboot -> consulta da ultima release ->
+//  comparacao semantica de versao -> download do asset MoniRes.bin -> tamanho +
+//  SHA-256 -> Update (particao inativa) -> reboot. Qualquer falha encerra a
+//  tentativa e o boot normal segue com o firmware atual, sem nova tentativa
+//  automatica.
+//
+//  A tentativa roda ANTES de ThingsBoard, History, AlertMonitor e Telegram, e
+//  por isso os tetos de tempo abaixo precisam ser finitos: o dispositivo nunca
+//  fica preso no boot.
+// ---------------------------------------------------------------------------
+constexpr char GITHUB_OTA_RELEASE_API[] =
+    "https://api.github.com/repos/jbacampos/MoniRes_ESP32/releases/latest";
+constexpr char GITHUB_OTA_ASSET_NAME[] = "MoniRes.bin";
+
+// A API do GitHub recusa requisicoes sem User-Agent identificavel.
+constexpr char GITHUB_OTA_USER_AGENT[] = "MoniRes-ESP32-OTA/1.0";
+
+// Tempos da tentativa.
+constexpr uint32_t GITHUB_OTA_NETWORK_WAIT_MS = 45000UL;   // Wi-Fi + NTP
+constexpr uint32_t GITHUB_OTA_HTTP_TIMEOUT_MS = 15000UL;   // uma requisicao
+constexpr uint32_t GITHUB_OTA_IDLE_TIMEOUT_MS = 20000UL;   // download parado
+constexpr uint32_t GITHUB_OTA_TOTAL_BUDGET_MS = 240000UL;  // tentativa inteira
+
+// Corpo maximo aceito da API. A release do MoniRes tem ~9 KB de JSON bruto; o
+// parser guarda apenas os campos filtrados (tag_name, draft, prerelease e os
+// quatro campos do asset).
+constexpr size_t GITHUB_OTA_API_MAX_BYTES = 32768;
+
+// Saltos seguidos: latest -> tag -> CDN assinado (2 reais, com folga).
+constexpr uint8_t GITHUB_OTA_MAX_REDIRECTS = 4;
+
+// Sanidade do asset antes de tocar a flash (o binario atual mede ~987 KB).
+constexpr uint32_t GITHUB_OTA_MIN_IMAGE_BYTES = 262144UL;  // 256 KB
+
+static_assert(GITHUB_OTA_MAX_REDIRECTS >= 2 && GITHUB_OTA_MAX_REDIRECTS <= 8,
+              "o download passa por dois redirecionamentos; nao seguir mais que 8");
+static_assert(GITHUB_OTA_IDLE_TIMEOUT_MS < GITHUB_OTA_TOTAL_BUDGET_MS,
+              "o timeout de inatividade deve caber no orcamento total");
+static_assert(GITHUB_OTA_HTTP_TIMEOUT_MS < GITHUB_OTA_TOTAL_BUDGET_MS,
+              "uma requisicao nao pode consumir o orcamento inteiro");
+static_assert(GITHUB_OTA_TOTAL_BUDGET_MS <= 300000UL,
+              "a tentativa OTA nao pode atrasar o boot por mais de 5 min");
+static_assert(GITHUB_OTA_MIN_IMAGE_BYTES >= 131072UL,
+              "imagem menor que 128 KB e recusada como corrompida");
 
 
 // ---------------------------------------------------------------------------

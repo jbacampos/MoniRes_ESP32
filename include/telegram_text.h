@@ -36,10 +36,17 @@
 //  a unica parte testavel sem hardware. O modulo src/telegram.cpp cuida de TLS,
 //  HTTP, JSON e das consultas ao historico; nada aqui conhece a rede.
 //
-//  Comandos: /help (/h), /status (/s) e /warnings (/w). /reboot e /ota NAO
-//  existem e nao sao anunciados. Comandos enderecados a um bot
+//  Comandos: /help (/h), /status (/s), /warnings (/w), /reboot e /ota.
+//  Comandos enderecados a um bot
 //  ("/status@QualquerBot") nao existem neste projeto: qualquer texto com '@' e
 //  recusado.
+//
+//  /reboot e /ota sao os unicos comandos SEM abreviacao e SEM argumentos:
+//  reiniciar e instalar firmware sao irreversiveis, entao "/r", "/reboot agora",
+//  "/reboot@Bot", "/ota agora" e "/ota@Bot" sao recusados pelo parser
+//  (TgCommand::None) e nem chegam a answerCommand(). Nenhum dos dois aparece no
+//  /help: a lista aprovada na B4.2.5 ja ocupa 363 dos 384 bytes de
+//  TG_MESSAGE_MAX, e acrescentar linhas exigiria rever esse limite.
 //
 //  As mensagens usam acentuacao em UTF-8 (o urlEncodeInto() de src/telegram.cpp
 //  codifica byte a byte) e separador de milhar com ponto nos litros.
@@ -49,6 +56,8 @@ enum class TgCommand : uint8_t {
   Help = 1,
   Status = 2,
   Warnings = 3,
+  Reboot = 4,
+  Ota = 5,
 };
 
 // Tamanho maximo de uma mensagem enviada (texto puro, antes do URL-encoding).
@@ -136,6 +145,14 @@ inline TgCommand parseTgCommand(const char *text, char *out, size_t outSize) {
   }
   if (tgMatchCommand(out, "/w") || tgMatchCommand(out, "/warnings")) {
     return TgCommand::Warnings;
+  }
+  // /reboot: sem abreviacao e sem argumentos (ver a nota no topo do arquivo).
+  if (tgMatchCommand(out, "/reboot")) {
+    return tgArgsOf(out)[0] == '\0' ? TgCommand::Reboot : TgCommand::None;
+  }
+  // /ota: mesma regra (sem abreviacao, sem argumentos).
+  if (tgMatchCommand(out, "/ota")) {
+    return tgArgsOf(out)[0] == '\0' ? TgCommand::Ota : TgCommand::None;
   }
   return TgCommand::None;
 }
@@ -505,6 +522,81 @@ inline void buildHelpMessage(char *out, size_t outSize) {
 }
 
 // ---------------------------------------------------------------------------
+//  /reboot
+// ---------------------------------------------------------------------------
+// Confirmacao enviada ANTES da reinicializacao. Se este envio falhar o
+// dispositivo NAO reinicia (ver Telegram::handleReboot): um reboot silencioso
+// deixaria o operador sem saber se o comando foi aceito.
+inline void buildRebootMessage(char *out, size_t outSize) {
+  snprintf(out, outSize,
+           TG_TEXT("Reinicialização solicitada pelo Telegram. O dispositivo "
+                   "será reiniciado."));
+}
+
+// /reboot recusado: o offset do update nao pode ser persistido, portanto o
+// mesmo comando voltaria depois do boot. Recusar e mais seguro do que arriscar
+// um ciclo de reinicializacoes.
+inline void buildRebootAbortMessage(char *out, size_t outSize) {
+  snprintf(out, outSize,
+           TG_TEXT("Reinicialização cancelada: não foi possível registrar o "
+                   "comando. O dispositivo continua em operação."));
+}
+
+// ---------------------------------------------------------------------------
+//  /ota
+// ---------------------------------------------------------------------------
+// Sequencia do comando:
+//   1. consulta a release (github_ota::check()) com o Telegram ainda atendendo
+//      o comando;
+//   2. sem versao posterior -> buildOtaUpToDateMessage(), SEM reboot;
+//   3. consulta impossivel   -> buildOtaCheckFailedMessage(), SEM reboot;
+//   4. versao posterior      -> buildOtaFoundMessage() e reboot; o download e a
+//      gravacao acontecem no boot, nunca durante o atendimento do comando.
+inline void buildOtaUpToDateMessage(const char *publishedTag,
+                                    const char *version, const char *reason,
+                                    char *out, size_t outSize) {
+  snprintf(out, outSize,
+           TG_TEXT("Nenhuma atualização a instalar.\n"
+                   "Instalada: %s\n"
+                   "Publicada: %s\n"
+                   "Motivo: %s\n"
+                   "O dispositivo continua em operação."),
+           version,
+           (publishedTag != nullptr && publishedTag[0] != '\0') ? publishedTag
+                                                               : "-",
+           reason);
+}
+
+// Versao posterior encontrada: diz qual e, e que o reboot vai instala-la.
+inline void buildOtaFoundMessage(const char *publishedTag, const char *version,
+                                 uint32_t bytes, char *out, size_t outSize) {
+  snprintf(out, outSize,
+           TG_TEXT("Nova versão disponível: %s\n"
+                   "Instalada: %s\n"
+                   "Imagem: %lu B\n"
+                   "Reiniciando para instalar."),
+           publishedTag, version, static_cast<unsigned long>(bytes));
+}
+
+// A consulta ao GitHub nao pode ser concluida: nada e alterado e o dispositivo
+// continua em operacao.
+inline void buildOtaCheckFailedMessage(const char *reason, char *out,
+                                       size_t outSize) {
+  snprintf(out, outSize,
+           TG_TEXT("Verificação OTA não concluída: %s.\n"
+                   "O dispositivo continua em operação."),
+           reason);
+}
+
+// /ota recusado ANTES do reboot (offset ou marcador NVS nao gravado, ou
+// confirmacao nao enviada). O dispositivo continua na versao atual.
+inline void buildOtaAbortMessage(char *out, size_t outSize) {
+  snprintf(out, outSize,
+           TG_TEXT("Solicitação OTA cancelada: não foi possível registrar o "
+                   "pedido. O dispositivo continua em operação."));
+}
+
+// ---------------------------------------------------------------------------
 //  Aviso de boot
 // ---------------------------------------------------------------------------
 // Mesmo padrao visual e de conteudo do Monitora_DG:
@@ -521,16 +613,25 @@ inline void buildHelpMessage(char *out, size_t outSize) {
 // nao o estado persistido: o reboot pode ter acontecido com o tanque em outro
 // nivel, e e essa a informacao que da contexto aos alertas que vierem depois
 // (inclusive o rebaseline silencioso de AlertMonitor, que nao envia mensagem).
+// `note` (opcional) entra como uma linha extra logo depois de "Versão:". O /ota
+// usa essa linha quando a verificacao rodou e nao instalou nada, para o operador
+// nao confundir a tentativa com um reinicio comum. Vazia ou nullptr = mensagem
+// exatamente como antes.
 inline void buildBootMessage(uint8_t bootReason, const char *version,
                              alerts::Level level, bool hasVolume, float volumeL,
-                             char *out, size_t outSize) {
+                             char *out, size_t outSize,
+                             const char *note = nullptr) {
+  const bool hasNote = note != nullptr && note[0] != '\0';
+  const char *noteBreak = hasNote ? "\n" : "";
+  const char *noteText = hasNote ? note : "";
+
   if (!hasVolume) {
     snprintf(out, outSize,
              TG_TEXT("Reiniciado.\n"
                      "Motivo: %s\n"
-                     "Versão: %s\n"
+                     "Versão: %s%s%s\n"
                      "Volume atual: sem leitura"),
-             bootReasonDescription(bootReason), version);
+             bootReasonDescription(bootReason), version, noteBreak, noteText);
     return;
   }
 
@@ -539,11 +640,11 @@ inline void buildBootMessage(uint8_t bootReason, const char *version,
   snprintf(out, outSize,
            TG_TEXT("Reiniciado.\n"
                    "Motivo: %s\n"
-                   "Versão: %s\n"
+                   "Versão: %s%s%s\n"
                    "Volume atual: %s\n\n"
                    "%s"),
-           bootReasonDescription(bootReason), version, alertLevelBadge(level),
-           liters);
+           bootReasonDescription(bootReason), version, noteBreak, noteText,
+           alertLevelBadge(level), liters);
 }
 
 // ---------------------------------------------------------------------------

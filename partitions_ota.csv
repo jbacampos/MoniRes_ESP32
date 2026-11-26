@@ -1,0 +1,35 @@
+# ============================================================================
+#  MoniRes_ESP32 - tabela de particoes com DOIS slots de aplicacao (OTA)
+#
+#  ESP32-WROOM-32, 4 MB de flash. Adotada na B5.2 (autorizada em 26/11/2026)
+#  para permitir atualizacao remota pelo comando /ota.
+#
+#  Layout (offsets conferidos, sem sobreposicao):
+#    nvs        20 KB   @0x09000   (Preferences: marcadores OTA)
+#    otadata     8 KB   @0x0E000   (selecao do slot de boot)
+#    app0     1664 KB   @0x10000   (ota_0)
+#    app1     1664 KB   @0x1B0000  (ota_1)
+#    spiffs    576 KB   @0x350000  (LittleFS: fila, historico, alertas)
+#    coredump   64 KB   @0x3E0000
+#
+#  app0/app1: o firmware mede ~987 KB; sobram ~677 KB (68%) para crescer.
+#  spiffs: 144 blocos de 4 KB (o piso do historico e 8 blocos = 32 KB).
+#
+#  ATENCAO: trocar a tabela move a regiao do LittleFS. O conteudo anterior
+#  (historico, alertas, fila offline, offset do Telegram) deixa de ser legivel
+#  no primeiro boot; o firmware NAO formata nada. Na bancada, uma unica vez:
+#      pio run -t upload
+#      pio run -t uploadfs
+#  Atualizacoes OTA posteriores reescrevem apenas app0/app1 e preservam o
+#  LittleFS.
+#
+#  O nome/subtipo "spiffs" e o que LittleFS.begin() procura no core Arduino;
+#  nao renomear.
+# ============================================================================
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xE000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x1A0000,
+app1,     app,  ota_1,   0x1B0000, 0x1A0000,
+spiffs,   data, spiffs,  0x350000, 0x90000,
+coredump, data, coredump,0x3E0000, 0x10000,

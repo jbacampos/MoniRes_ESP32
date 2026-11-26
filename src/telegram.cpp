@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_system.h>
@@ -16,7 +18,10 @@
 #include "clock.h"
 #include "config.h"
 #include "credentials.h"
+#include "github_ota.h"
 #include "history_record.h"
+#include "ota_marker.h"
+#include "queue_record.h"
 #include "telegram_ca.h"
 
 namespace {
@@ -34,6 +39,108 @@ char g_line[128];
 char g_normalized[TELEGRAM_TEXT_MAX];
 
 constexpr size_t kJsonCapacity = 2048;
+
+// ---------------------------------------------------------------------------
+//  Offset persistido do getUpdates (usado apenas pelo /reboot)
+//
+//  Registro de 24 B em dois slots A/B, com CRC32 - mesmo padrao de
+//  ALERT_FILE_A/B: a gravacao vai sempre para o slot INATIVO e a leitura
+//  escolhe a maior geracao valida, de modo que uma escrita interrompida deixa o
+//  registro anterior intacto. Layout:
+//    0..3   magic "TGO1"
+//    4      versao / 5 tamanho do registro / 6..7 reservado
+//    8..11  geracao
+//   12..19  proximo offset (update_id + 1, uint64 little-endian)
+//   20..23  CRC32 dos 20 bytes anteriores
+// ---------------------------------------------------------------------------
+constexpr uint32_t kOffsetMagic = 0x314F4754UL;  // "TGO1"
+constexpr uint8_t kOffsetVersion = 1;
+constexpr uint8_t kOffsetRecordSize = 24;
+
+struct OffsetRecord {
+  uint32_t generation = 0;
+  int64_t offset = 0;
+};
+
+void encodeOffsetRecord(uint8_t out[kOffsetRecordSize],
+                        const OffsetRecord &record) {
+  memset(out, 0, kOffsetRecordSize);
+  queue_record::put32(out + 0, kOffsetMagic);
+  out[4] = kOffsetVersion;
+  out[5] = kOffsetRecordSize;
+  queue_record::put32(out + 8, record.generation);
+  queue_record::put64(out + 12, static_cast<uint64_t>(record.offset));
+  queue_record::put32(out + 20, queue_record::crc32(out, 20));
+}
+
+// Le `out` (obrigatorio) inteiramente: o registro tem tamanho fixo e o CRC cobre
+// todos os campos variaveis.
+bool decodeOffsetRecord(const uint8_t in[kOffsetRecordSize],
+                        OffsetRecord &record) {
+  if (queue_record::get32(in + 0) != kOffsetMagic ||
+      in[4] != kOffsetVersion || in[5] != kOffsetRecordSize ||
+      queue_record::get32(in + 20) != queue_record::crc32(in, 20)) {
+    return false;
+  }
+  const int64_t offset = static_cast<int64_t>(queue_record::get64(in + 12));
+  if (offset < 0) {
+    return false;
+  }
+  record.generation = queue_record::get32(in + 8);
+  record.offset = offset;
+  return true;
+}
+
+bool readOffsetFile(const char *path, uint8_t raw[kOffsetRecordSize]) {
+  File file = LittleFS.open(path, "r");
+  if (!file) {
+    return false;
+  }
+  const size_t read = file.read(raw, kOffsetRecordSize);
+  file.close();
+  return read == kOffsetRecordSize;
+}
+
+// ---------------------------------------------------------------------------
+//  Espelho do offset em NVS
+//
+//  O LittleFS A/B continua sendo o registro principal, mas ele pode estar
+//  indisponivel (tabela de particoes recem-trocada, uploadfs pendente, FS
+//  corrompido). Sem o offset, um /reboot ou /ota nao pode reiniciar: o Telegram
+//  reenviaria o mesmo update no boot seguinte e entraria em ciclo. A NVS
+//  independe do filesystem e resolve esse caso (8 bytes, escrita apenas quando
+//  o valor muda).
+// ---------------------------------------------------------------------------
+constexpr char kNvsOffsetNamespace[] = "montg";
+constexpr char kNvsOffsetKey[] = "off";
+
+bool readNvsOffset(int64_t &value) {
+  Preferences prefs;
+  if (!prefs.begin(kNvsOffsetNamespace, true)) {
+    return false;
+  }
+  const int64_t stored = prefs.getLong64(kNvsOffsetKey, -1);
+  prefs.end();
+  if (stored < 0) {
+    return false;
+  }
+  value = stored;
+  return true;
+}
+
+bool writeNvsOffset(int64_t value) {
+  Preferences prefs;
+  if (!prefs.begin(kNvsOffsetNamespace, false)) {
+    return false;
+  }
+  if (prefs.getLong64(kNvsOffsetKey, -1) == value) {
+    prefs.end();
+    return true;  // nada mudou: nao regrava (evita desgaste da NVS)
+  }
+  const size_t written = prefs.putLong64(kNvsOffsetKey, value);
+  prefs.end();
+  return written == sizeof(int64_t);
+}
 
 bool deadlineExpired(uint32_t deadline) {
   return static_cast<int32_t>(millis() - deadline) >= 0;
@@ -357,6 +464,13 @@ bool authorizedChat(int64_t chatId) {
 }
 
 uint8_t currentBootReason() {
+  // B5.2: o marcador "applied" (gravado antes do reboot pos-instalacao) tem
+  // PRIORIDADE sobre esp_reset_reason(), que sozinho nao distingue uma
+  // atualizacao OTA de um /reboot - os dois reiniciam por software. O marcador
+  // e consumido aqui: vale para ESTE boot e nao contamina os seguintes.
+  if (ota_marker::consumeApplied()) {
+    return BOOT_REASON_OTA;
+  }
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON:
       return BOOT_REASON_POWER_ON;
@@ -432,6 +546,8 @@ const char *commandName(TgCommand command) {
     case TgCommand::Help: return "/help";
     case TgCommand::Status: return "/status";
     case TgCommand::Warnings: return "/warnings";
+    case TgCommand::Reboot: return "/reboot";
+    case TgCommand::Ota: return "/ota";
     case TgCommand::None:
     default: return "desconhecido";
   }
@@ -474,6 +590,9 @@ void Telegram::begin(uint32_t nowMs) {
   m_failures = 0;
   m_pendingWarned = false;
   m_heapWarned = false;
+  m_offsetSlot = 0;
+  m_offsetGeneration = 0;
+  m_fsWarned = false;
 
   closeClient();
   if (!m_enabled) {
@@ -484,6 +603,118 @@ void Telegram::begin(uint32_t nowMs) {
   }
   Serial.printf("Telegram: ativo | consulta a cada %lu s | HTTPS/TLS\n",
                 static_cast<unsigned long>(TELEGRAM_POLL_INTERVAL_MS / 1000UL));
+
+  // Um /reboot anterior deixou o PROXIMO offset em flash. Retoma-lo impede que o
+  // Telegram reenvie o proprio /reboot (ou qualquer update ja confirmado) depois
+  // do boot. Com offset retomado existe update confirmado, portanto o backlog do
+  // primeiro poll NAO e descartado - o fluxo normal de polling segue intacto.
+  if (loadUpdateOffset()) {
+    m_firstPoll = false;
+    Serial.printf("Telegram: offset retomado=%lld (geracao=%lu)\n",
+                  static_cast<long long>(m_updateOffset),
+                  static_cast<unsigned long>(m_offsetGeneration));
+  }
+}
+
+bool Telegram::loadUpdateOffset() {
+  bool found = false;
+  OffsetRecord chosen;
+
+  // 1) Registro principal: LittleFS A/B, com CRC e geracao.
+  const size_t totalBytes = LittleFS.totalBytes();
+  const size_t usedBytes = LittleFS.usedBytes();
+  if (totalBytes != 0 && usedBytes <= totalBytes) {
+    const char *paths[2] = {TELEGRAM_OFFSET_FILE_A, TELEGRAM_OFFSET_FILE_B};
+    for (uint8_t index = 0; index < 2; ++index) {
+      uint8_t raw[kOffsetRecordSize];
+      if (!readOffsetFile(paths[index], raw)) {
+        continue;
+      }
+      OffsetRecord decoded;
+      if (!decodeOffsetRecord(raw, decoded)) {
+        Serial.printf("TG: %s invalido (CRC/versao); ignorado\n", paths[index]);
+        continue;
+      }
+      if (!found || decoded.generation >= chosen.generation) {
+        chosen = decoded;
+        m_offsetSlot = index;
+        found = true;
+      }
+    }
+  } else {
+    Serial.println("TG: LittleFS indisponivel; usando o espelho em NVS");
+  }
+
+  // 2) Espelho em NVS: so vale se estiver a frente do registro do filesystem.
+  // Slot e geracao continuam vindo do LittleFS, para a alternancia A/B nao
+  // retroceder quando o FS voltar a montar.
+  int64_t nvsOffset = 0;
+  if (readNvsOffset(nvsOffset) && (!found || nvsOffset > chosen.offset)) {
+    chosen.offset = nvsOffset;
+    found = true;
+  }
+
+  if (!found) {
+    return false;
+  }
+  m_updateOffset = chosen.offset;
+  m_offsetGeneration = chosen.generation;
+  return true;
+}
+
+bool Telegram::persistUpdateOffset(int64_t nextOffset) {
+  // 1) Espelho em NVS: sempre tentado, inclusive com o LittleFS fora do ar
+  // (tabela de particoes nova, uploadfs pendente, FS corrompido).
+  bool stored = writeNvsOffset(nextOffset);
+  if (!stored) {
+    Serial.println("TG: NVS indisponivel; offset somente no LittleFS");
+  }
+
+  // 2) Registro principal em LittleFS: slots A/B, CRC e releitura.
+  const size_t totalBytes = LittleFS.totalBytes();
+  const size_t usedBytes = LittleFS.usedBytes();
+  if (totalBytes == 0 || usedBytes > totalBytes) {
+    if (!m_fsWarned) {
+      m_fsWarned = true;
+      Serial.println(
+          "TG: LittleFS indisponivel; offset mantido apenas em NVS.");
+    }
+    return stored;
+  }
+
+  const uint32_t generation = m_offsetGeneration + 1;
+  uint8_t raw[kOffsetRecordSize];
+  encodeOffsetRecord(raw, OffsetRecord{generation, nextOffset});
+
+  const char *path =
+      (m_offsetSlot == 0) ? TELEGRAM_OFFSET_FILE_B : TELEGRAM_OFFSET_FILE_A;
+  File file = LittleFS.open(path, "w");
+  if (!file) {
+    Serial.printf("TG: falha ao gravar o offset em %s\n", path);
+    return stored;
+  }
+  const size_t written = file.write(raw, sizeof(raw));
+  file.close();
+  if (written != sizeof(raw)) {
+    Serial.printf("TG: gravacao parcial do offset em %s (%u/%u B)\n", path,
+                  static_cast<unsigned>(written),
+                  static_cast<unsigned>(sizeof(raw)));
+    return stored;
+  }
+
+  // Releitura de verificacao: o reboot so prossegue com o offset confirmado em
+  // flash, porque e esse valor que impede o reenvio do mesmo update no boot.
+  uint8_t check[kOffsetRecordSize];
+  OffsetRecord verified;
+  if (!readOffsetFile(path, check) || !decodeOffsetRecord(check, verified) ||
+      verified.offset != nextOffset) {
+    Serial.printf("TG: offset em %s nao confere apos a gravacao\n", path);
+    return stored;
+  }
+
+  m_offsetGeneration = generation;
+  m_offsetSlot = static_cast<uint8_t>(m_offsetSlot == 0 ? 1 : 0);
+  return true;
 }
 
 void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
@@ -503,6 +734,15 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
   pollOnce(nowMs, context);
 }
 
+void Telegram::setOtaFailure(const char *reason) {
+  if (reason == nullptr || reason[0] == '\0') {
+    m_otaFailure[0] = '\0';
+    return;
+  }
+  snprintf(m_otaFailure, sizeof(m_otaFailure),
+           TG_TEXT("OTA: não atualizado (%s)"), reason);
+}
+
 void Telegram::sendBootNotice(uint32_t nowMs,
                               const TelegramContext &context) {
   if (m_bootNoticeSent ||
@@ -520,7 +760,8 @@ void Telegram::sendBootNotice(uint32_t nowMs,
       hasVolume ? context.alerts->levelForVolume(context.volumeL)
                 : alerts::Level::NORMAL;
   buildBootMessage(m_bootReason, FIRMWARE_VERSION, level, hasVolume,
-                   context.volumeL, g_message, sizeof(g_message));
+                   context.volumeL, g_message, sizeof(g_message),
+                   m_otaFailure);
   ++m_bootNoticeAttempts;
   if (sendMessage(chatId, g_message)) {
     m_bootNoticeSent = true;
@@ -705,6 +946,17 @@ void Telegram::pollOnce(uint32_t nowMs, const TelegramContext &context) {
 
 void Telegram::answerCommand(TgCommand command,
                              const TelegramContext &context, int64_t chatId) {
+  if (command == TgCommand::Reboot) {
+    // Fluxo proprio: persiste o offset, confirma e so entao reinicia.
+    handleReboot(chatId);
+    return;
+  }
+  if (command == TgCommand::Ota) {
+    // Fluxo proprio: offset + marcador NVS, confirma e reinicia. A consulta ao
+    // GitHub acontece no boot, nunca aqui.
+    handleOta(chatId);
+    return;
+  }
   if (command == TgCommand::Help) {
     buildHelpMessage(g_message, sizeof(g_message));
   } else if (command == TgCommand::Status) {
@@ -765,6 +1017,140 @@ void Telegram::answerCommand(TgCommand command,
   } else {
     Serial.printf("TG: resposta enviada %s\n", commandName(command));
   }
+}
+
+void Telegram::handleReboot(int64_t chatId) {
+  // pollOnce() ja avancou m_updateOffset para update_id + 1. Gravar esse valor
+  // ANTES de reiniciar e o que impede o Telegram de reenviar o proprio /reboot
+  // depois do boot: a primeira getUpdates nasce com o offset ja confirmado.
+  if (!persistUpdateOffset(m_updateOffset)) {
+    ++m_failures;
+    Serial.printf("TG: /reboot cancelado (offset %lld nao persistido)\n",
+                  static_cast<long long>(m_updateOffset));
+    buildRebootAbortMessage(g_message, sizeof(g_message));
+    closeClient();
+    const bool abortConnected = ensureConnection(millis());
+    if (abortConnected && sendMessage(chatId, g_message)) {
+      Serial.println("TG: resposta enviada /reboot cancelado");
+    } else {
+      ++m_failures;
+      Serial.println("TG: falha ao enviar /reboot cancelado");
+    }
+    return;
+  }
+  Serial.printf("TG: offset persistido=%lld (geracao=%lu)\n",
+                static_cast<long long>(m_updateOffset),
+                static_cast<unsigned long>(m_offsetGeneration));
+
+  buildRebootMessage(g_message, sizeof(g_message));
+  closeClient();
+  const bool connected = ensureConnection(millis());
+  const bool sent = connected && sendMessage(chatId, g_message);
+  if (!sent) {
+    ++m_failures;
+    // Sem a confirmacao o operador nao saberia que o pedido foi aceito. O
+    // offset ja persistido NAO e revertido de proposito: reenviar o /reboot no
+    // proximo poll reiniciaria o dispositivo sem ninguem saber quando.
+    Serial.println("TG: /reboot cancelado (confirmacao nao enviada)");
+    return;
+  }
+
+  Serial.println("TG: /reboot confirmado; reiniciando");
+  closeClient();
+  Serial.flush();
+  delay(TELEGRAM_REBOOT_SETTLE_MS);
+  ESP.restart();
+}
+
+void Telegram::sendOtaInfo(int64_t chatId, const char *text,
+                           const char *label) {
+  closeClient();
+  if (ensureConnection(millis()) && sendMessage(chatId, text)) {
+    Serial.printf("TG: resposta enviada %s\n", label);
+  } else {
+    ++m_failures;
+    Serial.printf("TG: falha ao enviar %s\n", label);
+  }
+}
+
+void Telegram::rejectOta(int64_t chatId, const char *reason) {
+  ++m_failures;
+  Serial.printf("TG: /ota cancelado (%s)\n", reason);
+  buildOtaAbortMessage(g_message, sizeof(g_message));
+  closeClient();
+  if (ensureConnection(millis()) && sendMessage(chatId, g_message)) {
+    Serial.println("TG: resposta enviada /ota cancelado");
+  } else {
+    ++m_failures;
+    Serial.println("TG: falha ao enviar /ota cancelado");
+  }
+}
+
+void Telegram::handleOta(int64_t chatId) {
+  // Sequencia: consulta a release com o Telegram ainda atendendo o comando ->
+  // responde sem reiniciar quando nao ha versao posterior ou quando a consulta
+  // falha -> so reinicia quando ha versao posterior, e entao o boot seguinte
+  // baixa, grava e reinicia na imagem nova.
+  //
+  // A sessao TLS do Telegram e fechada antes da consulta: o GitHub abre a dele,
+  // e duas sessoes TLS simultaneas no ESP32 seriam heap desperdicado.
+  closeClient();
+
+  github_ota::Release release;
+  const github_ota::Result check = github_ota::check(release);
+
+  if (check == github_ota::Result::NOT_NEWER) {
+    buildOtaUpToDateMessage(release.tag, FIRMWARE_VERSION,
+                            github_ota::resultText(check), g_message,
+                            sizeof(g_message));
+    sendOtaInfo(chatId, g_message, "/ota sem atualizacao");
+    return;
+  }
+  if (check != github_ota::Result::OK) {
+    Serial.printf("TG: /ota cancelado (consulta: %s)\n",
+                  github_ota::resultText(check));
+    buildOtaCheckFailedMessage(github_ota::resultText(check), g_message,
+                               sizeof(g_message));
+    sendOtaInfo(chatId, g_message, "/ota consulta nao concluida");
+    return;
+  }
+
+  // Ha versao posterior: os dois estados precisam sobreviver ao reinicio - o
+  // offset do update (para o Telegram nao reenviar /ota) e o marcador do pedido
+  // (para o boot saber que deve instalar). O offset vem primeiro: sem ele o
+  // comando voltaria e o dispositivo entraria em ciclo.
+  if (!persistUpdateOffset(m_updateOffset)) {
+    rejectOta(chatId, "offset nao persistido");
+    return;
+  }
+  if (!ota_marker::setRequest()) {
+    rejectOta(chatId, "marcador NVS nao gravado");
+    return;
+  }
+  Serial.printf("TG: marcador OTA gravado (offset=%lld, %s -> %s)\n",
+                static_cast<long long>(m_updateOffset), FIRMWARE_VERSION,
+                release.tag);
+
+  buildOtaFoundMessage(release.tag, FIRMWARE_VERSION, release.assetSize,
+                       g_message, sizeof(g_message));
+  closeClient();
+  const bool connected = ensureConnection(millis());
+  const bool sent = connected && sendMessage(chatId, g_message);
+  if (!sent) {
+    ++m_failures;
+    // Sem aviso o operador nao saberia que o pedido foi aceito. O marcador e
+    // removido para o proximo boot NAO tentar instalar.
+    ota_marker::clearRequest();
+    Serial.println(
+        "TG: /ota cancelado (aviso nao enviado); marcador removido");
+    return;
+  }
+
+  Serial.println("TG: /ota confirmado; reiniciando para instalar");
+  closeClient();
+  Serial.flush();
+  delay(TELEGRAM_REBOOT_SETTLE_MS);
+  ESP.restart();
 }
 
 bool Telegram::sendMessage(int64_t chatId, const char *text) {

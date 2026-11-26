@@ -16,6 +16,7 @@
 
 #include <Arduino.h>
 #include <WiFiClientSecure.h>
+#include <esp_ota_ops.h>
 
 #include "config.h"
 #include "credentials.h"
@@ -33,6 +34,8 @@
 #include "alert_monitor.h"
 #include "rate.h"
 #include "telegram.h"
+#include "github_ota.h"
+#include "ota_marker.h"
 
 namespace {
 
@@ -163,18 +166,48 @@ void setup() {
   // Wi-Fi e NTP
   g_wifi.begin(now);
   device_clock::begin(now);  // Use device_clock:: prefix
-  g_thingsBoard.begin(now);
-  g_history.begin(now);
-  g_alerts.begin(now);
-  rate::begin(g_rate, now);
-  g_telegram.begin(now);
 
-  g_lastSampleMs = now;
+  // Diagnostico de banco: app0 e o slot gravado por USB, app1 o destino do OTA.
+  // Sem esta linha nao ha como provar, pelo log, qual imagem esta em execucao
+  // quando os dois binarios tem a mesma versao.
+  const esp_partition_t *runningSlot = esp_ota_get_running_partition();
+  const esp_partition_t *nextSlot = esp_ota_get_next_update_partition(nullptr);
+  Serial.printf("OTA: slot em execucao=%s | proximo=%s\n",
+                runningSlot != nullptr ? runningSlot->label : "?",
+                nextSlot != nullptr ? nextSlot->label : "?");
+
+  // B5.2 - verificacao OTA pedida pelo /ota, ANTES dos servicos de aplicacao
+  // (ThingsBoard, History, AlertMonitor e Telegram). O marcador ja foi
+  // consumido aqui: uma falha nao se repete no proximo boot, e o firmware
+  // atual continua funcionando.
+  if (ota_marker::consumeRequest()) {
+    Serial.println("OTA: pedido pendente; iniciando verificacao");
+    const github_ota::Result otaResult = github_ota::attempt(now, g_wifi);
+    // attempt() so retorna quando NAO instalou: em sucesso ele reinicia a placa.
+    Serial.printf("OTA: FALHOU (%s); seguindo boot normal\n",
+                  github_ota::resultText(otaResult));
+    // O motivo vai no aviso de boot: sem isso a tentativa frustrada chegaria ao
+    // operador como um reinicio comum, sem nenhuma explicacao.
+    g_telegram.setOtaFailure(github_ota::resultText(otaResult));
+  } else {
+    Serial.println("OTA: sem pedido pendente");
+  }
+
+  // A tentativa OTA pode durar dezenas de segundos: os servicos recebem o
+  // instante ATUAL, nao o do inicio do setup.
+  const uint32_t servicesNow = millis();
+  g_thingsBoard.begin(servicesNow);
+  g_history.begin(servicesNow);
+  g_alerts.begin(servicesNow);
+  rate::begin(g_rate, servicesNow);
+  g_telegram.begin(servicesNow);
+
+  g_lastSampleMs = servicesNow;
 
   // Primeira amostra e primeiro diagnostico imediatos.
-  sampleAndProcess(now);
-  printDiagnostics(now);
-  g_lastDiagnosticMs = now;
+  sampleAndProcess(servicesNow);
+  printDiagnostics(servicesNow);
+  g_lastDiagnosticMs = servicesNow;
 }
 
 void loop() {
