@@ -40,7 +40,8 @@ constexpr bool TEST_MODE = true;  // true = test, false = production
 //  Usada pelo /status do Telegram (e disponivel para OTA/telemetria no futuro).
 //  Nao existe outra copia da versao no projeto.
 // ---------------------------------------------------------------------------
-constexpr char FIRMWARE_VERSION[] = "1.0.0";
+// constexpr char FIRMWARE_VERSION[] = "1.0.0"; // Migração de ESP8266 para ESP32
+constexpr char FIRMWARE_VERSION[] = "2.0.0"; // Publicação no ThingsBoard e comandos e alertas do Telegram
 
 // ---------------------------------------------------------------------------
 //  Hardware (ESP32 DevKit V1 30 pinos / WROOM-32)

@@ -29,6 +29,10 @@
 #include "wifi_manager.h"
 #include "clock.h"
 #include "thingsboard_manager.h"
+#include "history.h"
+#include "alert_monitor.h"
+#include "rate.h"
+#include "telegram.h"
 
 namespace {
 
@@ -40,6 +44,10 @@ DisplayManager g_display;
 UptimeCounter g_uptime;
 WiFiManager g_wifi;
 ThingsBoardManager g_thingsBoard;
+History g_history;
+AlertMonitor g_alerts;
+Telegram g_telegram;
+rate::Ring g_rate;
 
 volume::Measurement g_lastMeasurement;
 float g_filteredLiters = 0.0f;
@@ -156,6 +164,10 @@ void setup() {
   g_wifi.begin(now);
   device_clock::begin(now);  // Use device_clock:: prefix
   g_thingsBoard.begin(now);
+  g_history.begin(now);
+  g_alerts.begin(now);
+  rate::begin(g_rate, now);
+  g_telegram.begin(now);
 
   g_lastSampleMs = now;
 
@@ -182,13 +194,34 @@ void loop() {
   // Refresh, desligamento e botao do display (temporizacao interna propria).
   g_display.update(now);
 
+  // Taxa recente baseada no mesmo volume filtrado usado pelo display, MQTT,
+  // historico, alertas e Telegram.
+  rate::update(g_rate, now, g_filteredLiters, g_hasSample);
+
   TelemetrySample sample;
   sample.volumeL = g_filteredLiters;
   sample.timestampMs = device_clock::synced() ? device_clock::nowMs() : 0;
   sample.uptimeS = g_uptime.seconds();
   sample.valid = g_hasSample;
 
+  // O historico recebe as amostras antes de qualquer relatorio Telegram.
+  g_history.update(now, device_clock::synced(), sample.timestampMs,
+                   g_filteredLiters, g_hasSample);
+
+  // O monitor processa o volume antes de Telegram consultar eventos pendentes.
+  g_alerts.update(now, g_filteredLiters, g_hasSample);
+
   g_thingsBoard.update(now, sample, g_wifi.connected());
+
+  TelegramContext telegramContext;
+  telegramContext.volumeL = g_filteredLiters;
+  telegramContext.uptimeS = sample.uptimeS;
+  telegramContext.sampleValid = g_hasSample;
+  telegramContext.rateLpm = rate::litersPerMinute(g_rate);
+  telegramContext.hasRate = rate::hasRate(g_rate);
+  telegramContext.history = &g_history;
+  telegramContext.alerts = &g_alerts;
+  g_telegram.update(now, telegramContext);
 
   // Diagnostico em frequencia propria.
   if ((now - g_lastDiagnosticMs) >= DIAGNOSTIC_INTERVAL_MS) {
