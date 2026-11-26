@@ -144,7 +144,7 @@ class Telegram {
 
   // Linha extra do aviso de boot quando a verificacao OTA do boot nao instalou
   // (texto pronto, montado por setOtaFailure()).
-  char m_otaFailure[96] = {0};
+  char m_otaFailure[128] = {0};
   uint8_t m_bootNoticeAttempts = 0;
   bool m_bootNoticeSent = false;
 

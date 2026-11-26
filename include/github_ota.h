@@ -73,4 +73,9 @@ Result attempt(uint32_t bootMs, WiFiManager &wifi);
 // Texto curto do resultado, para o Serial (nunca contem token/credencial).
 const char *resultText(Result result);
 
+// Mesma informacao ACENTUADA, para as MENSAGENS DO TELEGRAM. As duas versoes
+// existem de proposito: o log serial deste projeto e ASCII puro, enquanto as
+// mensagens do Telegram usam acentuacao em UTF-8. Nao trocar uma pela outra.
+const char *resultTextTelegram(Result result);
+
 }  // namespace github_ota

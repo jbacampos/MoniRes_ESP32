@@ -188,7 +188,9 @@ void setup() {
                   github_ota::resultText(otaResult));
     // O motivo vai no aviso de boot: sem isso a tentativa frustrada chegaria ao
     // operador como um reinicio comum, sem nenhuma explicacao.
-    g_telegram.setOtaFailure(github_ota::resultText(otaResult));
+    // O motivo vai no aviso de boot (texto acentuado, para o Telegram); o log
+    // serial continua com a versao ASCII.
+    g_telegram.setOtaFailure(github_ota::resultTextTelegram(otaResult));
   } else {
     Serial.println("OTA: sem pedido pendente");
   }

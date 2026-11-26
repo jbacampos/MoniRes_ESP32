@@ -565,6 +565,40 @@ github_ota::Result github_ota::attempt(uint32_t bootMs, WiFiManager &wifi) {
   return Result::OK;
 }
 
+const char *github_ota::resultTextTelegram(Result result) {
+  switch (result) {
+    case Result::OK:
+      return "atualizado";
+    case Result::NO_NETWORK:
+      return "sem Wi-Fi ou NTP";
+    case Result::NO_RELEASE:
+      return "nenhuma release publicada (HTTP 404)";
+    case Result::FORBIDDEN:
+      return "consulta recusada (HTTP 403/429)";
+    case Result::BAD_RESPONSE:
+      return "resposta da API inválida";
+    case Result::NOT_NEWER:
+      return "a versão publicada não é posterior à instalada (ou é "
+             "rascunho/pré-lançamento)";
+    case Result::NO_ASSET:
+      return "imagem MoniRes.bin ausente ou inválida";
+    case Result::NO_PARTITION:
+      return "partição OTA ausente";
+    case Result::TARGET_SIZE:
+      return "imagem maior que a partição de destino";
+    case Result::DOWNLOAD_FAILED:
+      return "falha no download";
+    case Result::SIZE_MISMATCH:
+      return "tamanho recebido diferente do anunciado";
+    case Result::DIGEST_MISMATCH:
+      return "SHA-256 divergente";
+    case Result::INSTALL_FAILED:
+      return "falha ao gravar a imagem";
+    default:
+      return "motivo desconhecido";
+  }
+}
+
 const char *github_ota::resultText(Result result) {
   switch (result) {
     case Result::OK:

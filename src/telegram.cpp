@@ -1101,7 +1101,7 @@ void Telegram::handleOta(int64_t chatId) {
 
   if (check == github_ota::Result::NOT_NEWER) {
     buildOtaUpToDateMessage(release.tag, FIRMWARE_VERSION,
-                            github_ota::resultText(check), g_message,
+                            github_ota::resultTextTelegram(check), g_message,
                             sizeof(g_message));
     sendOtaInfo(chatId, g_message, "/ota sem atualizacao");
     return;
@@ -1109,7 +1109,7 @@ void Telegram::handleOta(int64_t chatId) {
   if (check != github_ota::Result::OK) {
     Serial.printf("TG: /ota cancelado (consulta: %s)\n",
                   github_ota::resultText(check));
-    buildOtaCheckFailedMessage(github_ota::resultText(check), g_message,
+    buildOtaCheckFailedMessage(github_ota::resultTextTelegram(check), g_message,
                                sizeof(g_message));
     sendOtaInfo(chatId, g_message, "/ota consulta nao concluida");
     return;
