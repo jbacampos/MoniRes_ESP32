@@ -44,7 +44,7 @@ constexpr bool TEST_MODE = true;  // true = test, false = production
 // O valor TEM de ser igual ao tag da release publicada: o /ota compara o tag com
 // esta string, e um binario cuja versao interna fica atras do proprio tag faz o
 // dispositivo reinstalar a mesma imagem em todo /ota.
-constexpr char FIRMWARE_VERSION[] = "2.1.3"; // Publicação no ThingsBoard e comandos e alertas do Telegram
+constexpr char FIRMWARE_VERSION[] = "2.1.4"; // Publicação no ThingsBoard e comandos e alertas do Telegram
 
 // ---------------------------------------------------------------------------
 //  Hardware (ESP32 DevKit V1 30 pinos / WROOM-32)
